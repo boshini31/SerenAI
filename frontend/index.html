@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mom's Bot - Day 1</title>
+</head>
+<body>
+    <h2>Signup</h2>
+    <form onsubmit="signup(event)">
+        <input type="text" id="name" placeholder="Name"><br>
+        <input type="email" id="email" placeholder="Email"><br>
+        <input type="password" id="password" placeholder="Password"><br>
+        <button type="submit">Signup</button>
+    </form>
+
+    <h2>Login</h2>
+    <form onsubmit="login(event)">
+        <input type="email" id="loginEmail" placeholder="Email"><br>
+        <input type="password" id="loginPassword" placeholder="Password"><br>
+        <button type="submit">Login</button>
+    </form>
+
+    <script>
+        const API = "http://127.0.0.1:8000";
+
+        async function signup(e) {
+            e.preventDefault();
+            const res = await fetch(`${API}/signup`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    name: document.getElementById("name").value,
+                    email: document.getElementById("email").value,
+                    password: document.getElementById("password").value
+                })
+            });
+            const data = await res.json();
+            alert(JSON.stringify(data));
+        }
+
+        async function login(e) {
+            e.preventDefault();
+            const res = await fetch(`${API}/login`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    email: document.getElementById("loginEmail").value,
+                    password: document.getElementById("loginPassword").value
+                })
+            });
+            const data = await res.json();
+            alert(JSON.stringify(data));
+        }
+    </script>
+</body>
+</html>
