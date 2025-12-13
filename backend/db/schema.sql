@@ -151,3 +151,119 @@ CREATE TABLE error_occurrence (
 CREATE INDEX ix_error_occurrence_error_code ON error_occurrence(error_code);
 CREATE INDEX ix_error_occurrence_user_id ON error_occurrence(user_id);
 CREATE INDEX ix_error_occurrence_created_at ON error_occurrence(created_at);
+
+-- ======================
+-- 9) user_events
+-- ======================
+CREATE TABLE user_events (
+  id              BIGSERIAL PRIMARY KEY,
+  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+  event_type      TEXT NOT NULL,  
+  -- example: mistake, improvement, habit, emotion, milestone
+
+  event_key       TEXT NOT NULL,  
+  -- example: skipped_meal, missed_deadline, procrastination
+
+  severity        TEXT NOT NULL DEFAULT 'medium',
+  -- low / medium / high
+
+  source          TEXT NOT NULL DEFAULT 'user',
+  -- user / ai / system
+
+  context         JSONB,
+  -- free-form details (what happened, why, extra info)
+
+  occurred_at     timestamptz NOT NULL DEFAULT now(),
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ix_user_events_user_id ON user_events(user_id);
+CREATE INDEX ix_user_events_event_key ON user_events(event_key);
+CREATE INDEX ix_user_events_event_type ON user_events(event_type);
+
+ALTER TABLE user_events
+  ADD CONSTRAINT chk_user_events_severity
+  CHECK (severity IN ('low','medium','high'));
+
+ALTER TABLE user_events
+  ADD CONSTRAINT chk_user_events_source
+  CHECK (source IN ('user','ai','system'));
+
+-- ======================
+-- 10) behavior_patterns
+-- ======================
+CREATE TABLE behavior_patterns (
+  id                BIGSERIAL PRIMARY KEY,
+  user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+  pattern_key       TEXT NOT NULL,
+  -- example: repeated:skipped_meal
+
+  related_event_key TEXT NOT NULL,
+  -- example: skipped_meal
+
+  occurrence_count  INTEGER NOT NULL DEFAULT 1,
+
+  first_seen_at     timestamptz NOT NULL DEFAULT now(),
+  last_seen_at      timestamptz NOT NULL DEFAULT now(),
+
+  status            TEXT NOT NULL DEFAULT 'active',
+  -- active / resolved / ignored
+
+  meta              JSONB,
+
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX ux_behavior_patterns_user_event
+  ON behavior_patterns(user_id, pattern_key);
+
+CREATE INDEX ix_behavior_patterns_user_id ON behavior_patterns(user_id);
+
+ALTER TABLE behavior_patterns
+  ADD CONSTRAINT chk_behavior_patterns_status
+  CHECK (status IN ('active','resolved','ignored'));
+
+-- ======================
+-- 11) seren_memory
+-- ======================
+CREATE TABLE seren_memory (
+  id                BIGSERIAL PRIMARY KEY,
+  user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+  memory_type       TEXT NOT NULL,
+  -- emotional / behavioral / preference / trust
+
+  memory_key        TEXT NOT NULL,
+  -- example: reacts_well_to_gentle_tone
+
+  memory_value      JSONB NOT NULL,
+  -- structured learned data
+
+  confidence_score  NUMERIC DEFAULT 0.5,
+  -- 0.0 to 1.0
+
+  source            TEXT NOT NULL DEFAULT 'ai',
+  -- ai / system / manual
+
+  last_reinforced_at timestamptz,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX ux_seren_memory_user_key
+  ON seren_memory(user_id, memory_key);
+
+CREATE INDEX ix_seren_memory_user_id ON seren_memory(user_id);
+
+ALTER TABLE seren_memory
+  ADD CONSTRAINT chk_seren_memory_type
+  CHECK (memory_type IN ('emotional','behavioral','preference','trust'));
+
+ALTER TABLE seren_memory
+  ADD CONSTRAINT chk_seren_memory_source
+  CHECK (source IN ('ai','system','manual'));
+
+

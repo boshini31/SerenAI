@@ -316,7 +316,8 @@ async def upload_mom_voice(
     session.commit()
 
     # update voice_count on mom profile
-    cnt = session.exec(select(MomVoice).where(MomVoice.mom_profile_id == mom.id, MomVoice.is_active == True)).count()
+    voices = session.exec(select(MomVoice).where(MomVoice.mom_profile_id == mom.id, MomVoice.is_active == True)).all()
+    cnt = len(voices)
     mom.voice_count = cnt
     mom.consent_given = True
     mom.updated_at = datetime.utcnow() if hasattr(mom, "updated_at") else mom.created_at
