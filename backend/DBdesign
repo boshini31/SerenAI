@@ -1,0 +1,115 @@
+-- 1) users
+CREATE TABLE IF NOT EXISTS users (
+  id              SERIAL PRIMARY KEY,
+  email           TEXT NOT NULL UNIQUE,
+  hashed_password TEXT NOT NULL,
+  name            TEXT,
+  is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  last_login_at   timestamptz
+);
+
+-- 2) user_profiles (one row per user)
+CREATE TABLE IF NOT EXISTS user_profiles (
+  id          SERIAL PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  full_name   TEXT,
+  dob         DATE,
+  preferences JSONB,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_user_profiles_user_id ON user_profiles(user_id);
+
+-- 3) mom_profiles (personality + voice metadata)
+CREATE TABLE IF NOT EXISTS mom_profiles (
+  id                  SERIAL PRIMARY KEY,
+  user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  personality         JSONB,            -- structured personality JSON
+  voice_model_id      TEXT,             -- vendor/local model identifier (nullable)
+  voice_model_type    TEXT,             -- e.g. "elevenlabs", "coqui", "local"
+  voice_ready         BOOLEAN NOT NULL DEFAULT FALSE,
+  persona_model_id    TEXT,             -- optional persona fine-tune id
+  persona_ready       BOOLEAN NOT NULL DEFAULT FALSE,
+  consent_given       BOOLEAN NOT NULL DEFAULT FALSE,
+  consent_granted_at  timestamptz,
+  voice_count         INTEGER NOT NULL DEFAULT 0,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_mom_profiles_user_id ON mom_profiles(user_id);
+
+-- 4) mom_voices (one row per uploaded audio sample)
+CREATE TABLE IF NOT EXISTS mom_voices (
+  id             SERIAL PRIMARY KEY,
+  mom_profile_id INTEGER NOT NULL REFERENCES mom_profiles(id) ON DELETE CASCADE,
+  user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  filename       TEXT NOT NULL,   -- original filename
+  stored_name    TEXT NOT NULL,   -- uuid-based safe filename or s3 key
+  path           TEXT NOT NULL,   -- relative path or S3 URI
+  mime_type      TEXT,
+  size_bytes     BIGINT,
+  duration_secs  NUMERIC,         -- optional audio length
+  checksum       TEXT,            -- optional sha256
+  status         TEXT NOT NULL DEFAULT 'pending', -- pending/validated/trained/rejected
+  uploaded_at    timestamptz NOT NULL DEFAULT now(),
+  is_active      BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS ix_mom_voices_mom_profile_id ON mom_voices(mom_profile_id);
+CREATE INDEX IF NOT EXISTS ix_mom_voices_user_id ON mom_voices(user_id);
+
+-- 5) jobs (background job tracking)
+CREATE TABLE IF NOT EXISTS jobs (
+  id         SERIAL PRIMARY KEY,
+  user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  type       TEXT NOT NULL,    -- e.g., voice_train, persona_train, persona_eval
+  status     TEXT NOT NULL,    -- queued, running, success, failed
+  meta       JSONB,            -- job-specific data
+  error_msg  TEXT,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_jobs_user_id ON jobs(user_id);
+CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status);
+
+-- 6) audit_events (optional)
+CREATE TABLE IF NOT EXISTS audit_events (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL,   -- signup, login, upload_voice, train_started, train_completed
+  payload    JSONB,
+  ip_address INET,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_audit_events_user_id ON audit_events(user_id);
+CREATE INDEX IF NOT EXISTS ix_audit_events_event_type ON audit_events(event_type);
+
+-- master catalog of canonical errors (editable by admin / translators)
+CREATE TABLE IF NOT EXISTS error_catalog (
+  id            SERIAL PRIMARY KEY,
+  error_code    TEXT NOT NULL UNIQUE,      -- machine code, e.g. "USER_NOT_FOUND"
+  http_status   INTEGER NOT NULL,          -- recommended HTTP status
+  short_message TEXT NOT NULL,             -- brief default message (EN)
+  long_message  TEXT,                      -- detailed message / remediation (EN)
+  severity      TEXT NOT NULL DEFAULT 'error', -- info/warn/error/critical
+  i18n_key      TEXT,                      -- optional key for localized lookup
+  tags          TEXT[],                    -- optional tags e.g., ['auth','user']
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_error_catalog_error_code ON error_catalog(error_code);
+
+-- occurrences logged when an error happens (for debugging/metrics)
+CREATE TABLE IF NOT EXISTS error_occurrence (
+  id            BIGSERIAL PRIMARY KEY,
+  error_code    TEXT NOT NULL REFERENCES error_catalog(error_code) ON DELETE RESTRICT,
+  user_id       INTEGER NULL,              -- which user (if known)
+  request_path  TEXT,
+  http_method   TEXT,
+  http_status   INTEGER,
+  details       JSONB,                     -- optional structured details (stack, payload)
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_error_occurrence_error_code ON error_occurrence(error_code);
+CREATE INDEX IF NOT EXISTS ix_error_occurrence_user_id ON error_occurrence(user_id);
+CREATE INDEX IF NOT EXISTS ix_error_occurrence_created_at ON error_occurrence(created_at);
