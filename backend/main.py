@@ -3,86 +3,35 @@ import os
 import uuid
 import json
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List
-
+from db.models import UserEvent
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlmodel import SQLModel, select, Session
 from passlib.context import CryptContext
 from dotenv import load_dotenv
-import jwt
 import aiofiles
 
-# --- env + paths ---
+from db.session import engine, get_session
+from db.models import User, UserProfile, MomProfile, MomVoice
+
+# -------------------------------------------------
+# ENV
+# -------------------------------------------------
 load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set in .env")
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change")
 
 BASE_DIR = os.path.dirname(__file__)
 VOICE_DIR = os.path.join(BASE_DIR, "static", "mom_voices")
 os.makedirs(VOICE_DIR, exist_ok=True)
 
-# --- crypto / hashing ---
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# bcrypt limit helper: truncate to 72 bytes (bcrypt limitation).
-def safe_password_bytes(pw: str) -> bytes:
-    if pw is None:
-        return b""
-    b = pw.encode("utf-8")
-    if len(b) > 72:
-        # truncate bytes (advisable to inform user in real app)
-        return b[:72]
-    return b
-
-def hash_password(password: str) -> str:
-    # Pass bytes-safe password to passlib; passlib will accept str but we ensure truncation
-    pw = safe_password_bytes(password).decode("utf-8", errors="ignore")
-    return pwd_context.hash(pw)
-
-def verify_password(plain: str, hashed: str) -> bool:
-    pw = safe_password_bytes(plain).decode("utf-8", errors="ignore")
-    return pwd_context.verify(pw, hashed)
-
-# --- JWT helpers ---
-def create_access_token(data: dict, expires_minutes: int = 1440):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=expires_minutes)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, JWT_SECRET, algorithm="HS256")
-
-def decode_access_token(token: str):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# --- DB session / models (expected to exist in backend/db) ---
-# from db.session import engine, get_session  # you already have this file per earlier messages
-# from db.models import User, UserProfile, MomProfile, MomVoice
-#
-# To avoid circular import problems during copy-paste, import here:
-try:
-    from db.session import engine, get_session
-    from db.models import User, UserProfile, MomProfile, MomVoice
-except Exception as e:
-    raise RuntimeError("Make sure backend/db/session.py and backend/db/models.py exist and export engine, get_session and models. Error: " + str(e))
-
-# Optional: create missing tables from SQLModel metadata (dev convenience)
-def create_db():
-    SQLModel.metadata.create_all(engine)
-
-# --- FastAPI app ---
+# -------------------------------------------------
+# APP
+# -------------------------------------------------
 app = FastAPI(title="SerenAI — My Mom's Bot")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -91,39 +40,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(BASE_DIR, "static")),
+    name="static"
+)
 
 @app.on_event("startup")
 def on_startup():
-    # ensure tables exist in dev
-    create_db()
+    SQLModel.metadata.create_all(engine)
 
-# --- Auth dependency ---
-bearer_scheme = HTTPBearer(auto_error=False)
+# -------------------------------------------------
+# DEV AUTH (FROZEN)
+# -------------------------------------------------
+def get_dev_user(session: Session = Depends(get_session)) -> User:
+    """
+    Single global dev user for Phase 1
+    """
+    user = session.exec(select(User).where(User.id == 1)).first()
 
-def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
-                     session: Session = Depends(get_session)) -> User:
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
-    token = credentials.credentials
-    payload = decode_access_token(token)
-    user_id = payload.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-    user = session.exec(select(User).where(User.id == user_id)).first()
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        user = User(
+            email="dev@seren.ai",
+            hashed_password="dev",
+            name="Seren Dev User"
+        )
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
     return user
 
-# --- Pydantic Schemas ---
+def get_current_user(
+    session: Session = Depends(get_session)
+) -> User:
+    """
+    AUTH COMPLETELY BYPASSED
+    """
+    return get_dev_user(session)
+
+# -------------------------------------------------
+# PASSWORD UTILS (kept for later)
+# -------------------------------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password[:72])
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain[:72], hashed)
+
+# -------------------------------------------------
+# SCHEMAS
+# -------------------------------------------------
 class SignupIn(BaseModel):
     email: str
     password: str
     name: Optional[str] = None
-
-class LoginIn(BaseModel):
-    email: str
-    password: str
 
 class ProfileIn(BaseModel):
     full_name: Optional[str] = None
@@ -133,125 +106,208 @@ class ProfileIn(BaseModel):
 class PersonalityIn(BaseModel):
     personality: dict
 
-# --- Routes ---
+class ChatIn(BaseModel):
+    message: str
+
+class ChatOut(BaseModel):
+    reply: str
+    tone: str
+
+INTENT_RESPONSES = {
+    "mistake": {
+        "gentle": {
+            "reply": "Hmm… kanna, it’s okay. But take care of yourself, no?",
+            "tone": "gentle-care"
+        },
+        "anger": {
+            "reply": "Kanna… how many times now? I’m saying this because I care. Don’t hurt yourself like this.",
+            "tone": "caring-anger"
+        }
+    },
+    "sadness": {
+        "reply": "Come here… you don’t have to feel alone. I’m with you.",
+        "tone": "comforting"
+    },
+    "fatigue": {
+        "reply": "You sound very tired. Please rest a little, kanna.",
+        "tone": "nurturing"
+    },
+    "neutral": {
+        "reply": "I’m listening. Tell me slowly.",
+        "tone": "gentle"
+    }
+    INTENT_RESPONSES["improvement"] = {
+    "reply": "That makes me really happy, kanna. I knew you could do it.",
+    "tone": "proud"
+      }
+
+}
+
+def detect_intent(message: str) -> str:
+    msg = message.lower()
+
+    if any(w in msg for w in ["skip", "missed", "forgot", "didn't"]):
+        return "mistake"
+
+    if any(w in msg for w in ["sad", "lonely", "alone", "cry"]):
+        return "sadness"
+
+    if any(w in msg for w in ["tired", "exhausted", "burnt"]):
+        return "fatigue"
+
+    if any(w in msg for w in ["ate", "had food", "took care", "did eat"]):
+        return "improvement"
+    
+    return "neutral"
+
+def intent_to_event(intent: str):
+    if intent == "mistake":
+        return {
+            "event_type": "mistake",
+            "event_key": "generic_mistake",
+            "severity": "medium"
+        }
+    if intent == "sadness":
+        return {
+            "event_type": "emotion",
+            "event_key": "sadness",
+            "severity": "medium"
+        }
+    if intent == "fatigue":
+        return {
+            "event_type": "emotion",
+            "event_key": "fatigue",
+            "severity": "low"
+        }
+    return None
+
+def count_recent_events(
+    session: Session,
+    user_id: int,
+    event_key: str,
+    limit: int = 5
+) -> int:
+    """
+    Count recent occurrences of the same event for the user
+    """
+    events = session.exec(
+        select(UserEvent)
+        .where(
+            UserEvent.user_id == user_id,
+            UserEvent.event_key == event_key
+        )
+        .order_by(UserEvent.occurred_at.desc())
+        .limit(limit)
+    ).all()
+
+    return len(events)
+
+def get_recent_event_counts(
+    session: Session,
+    user_id: int,
+    event_key: str,
+    limit: int = 3
+):
+    events = session.exec(
+        select(UserEvent)
+        .where(
+            UserEvent.user_id == user_id,
+            UserEvent.event_key == event_key
+        )
+        .order_by(UserEvent.occurred_at.desc())
+        .limit(limit)
+    ).all()
+
+    return len(events), events
+
+
+# -------------------------------------------------
+# ROUTES
+# -------------------------------------------------
 @app.get("/")
 def home():
-    return {"message": "SerenAI backend running"}
+    return {"message": "SerenAI backend running (Phase 1)"}
 
-# Auth
-@app.post("/signup")
-def signup(payload: SignupIn, session: Session = Depends(get_session)):
-    existing = session.exec(select(User).where(User.email == payload.email)).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    user = User(
-        email=payload.email,
-        hashed_password=hash_password(payload.password),
-        name=payload.name
-    )
-    session.add(user)
-    session.commit()
-    session.refresh(user)
-    token = create_access_token({"user_id": user.id, "email": user.email})
-    return {"message": "Signup successful", "user_id": user.id, "token": token}
-
-@app.post("/login")
-def login(payload: LoginIn, session: Session = Depends(get_session)):
-    user = session.exec(select(User).where(User.email == payload.email)).first()
-    if not user or not verify_password(payload.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_access_token({"user_id": user.id, "email": user.email})
-    # update last_login_at (optional)
-    user.last_login_at = datetime.utcnow()
-    session.add(user)
-    session.commit()
-    return {"message": "Login successful", "user_id": user.id, "token": token}
-
-# Profile (authenticated)
+# -------------------------------------------------
+# PROFILE
+# -------------------------------------------------
 @app.post("/api/profile")
-def save_profile(payload: ProfileIn, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
-    existing = session.exec(select(UserProfile).where(UserProfile.user_id == current_user.id)).first()
-    pref_json = json.dumps(payload.preferences or {})
-    if existing:
-        existing.full_name = payload.full_name or existing.full_name
-        existing.dob = payload.dob or existing.dob
-        existing.preferences = pref_json if hasattr(existing, "preferences") else pref_json
-        session.add(existing)
-        session.commit()
-        session.refresh(existing)
-        return {"status": "updated", "profile_id": existing.id}
-    profile = UserProfile(user_id=current_user.id, full_name=payload.full_name, dob=payload.dob, preferences=pref_json)
-    session.add(profile)
+def save_profile(
+    payload: ProfileIn,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    profile = session.exec(
+        select(UserProfile).where(UserProfile.user_id == current_user.id)
+    ).first()
+
+    if profile:
+        profile.full_name = payload.full_name
+        profile.dob = payload.dob
+        profile.preferences = payload.preferences
+    else:
+        profile = UserProfile(
+            user_id=current_user.id,
+            full_name=payload.full_name,
+            dob=payload.dob,
+            preferences=payload.preferences
+        )
+        session.add(profile)
+
     session.commit()
     session.refresh(profile)
-    return {"status": "created", "profile_id": profile.id}
+
+    return {"status": "ok", "profile_id": profile.id}
 
 @app.get("/api/profile")
-def get_profile(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
-    profile = session.exec(select(UserProfile).where(UserProfile.user_id == current_user.id)).first()
+def get_profile(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    profile = session.exec(
+        select(UserProfile).where(UserProfile.user_id == current_user.id)
+    ).first()
+
     if not profile:
-        return {"user_id": current_user.id, "full_name": None, "dob": None, "preferences": {}, "created_at": None}
-    # preferences might be stored as JSONB or string - handle both
-    prefs = {}
-    try:
-        prefs = json.loads(profile.preferences) if isinstance(profile.preferences, str) else (profile.preferences or {})
-    except Exception:
-        prefs = profile.preferences or {}
+        return {}
+
     return {
         "user_id": profile.user_id,
         "full_name": profile.full_name,
-        "dob": profile.dob.isoformat() if getattr(profile, "dob", None) else profile.dob,
-        "preferences": prefs,
-        "created_at": profile.created_at.isoformat() if profile.created_at else None
+        "dob": profile.dob,
+        "preferences": profile.preferences
     }
 
-# Mom personality endpoints (authenticated)
+# -------------------------------------------------
+# MOM PROFILE
+# -------------------------------------------------
 @app.post("/api/mom/personality")
-def save_mom_personality(payload: PersonalityIn, current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
-    existing = session.exec(select(MomProfile).where(MomProfile.user_id == current_user.id)).first()
-    pj = payload.personality or {}
-    if existing:
-        existing.personality = pj
-        session.add(existing)
-        session.commit()
-        session.refresh(existing)
-        return {"status": "updated", "mom_profile_id": existing.id}
-    mom = MomProfile(user_id=current_user.id, personality=pj, voice_count=0, consent_given=False)
-    session.add(mom)
+def save_mom_personality(
+    payload: PersonalityIn,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    mom = session.exec(
+        select(MomProfile).where(MomProfile.user_id == current_user.id)
+    ).first()
+
+    if not mom:
+        mom = MomProfile(
+            user_id=current_user.id,
+            personality=payload.personality
+        )
+        session.add(mom)
+    else:
+        mom.personality = payload.personality
+
     session.commit()
     session.refresh(mom)
-    return {"status": "created", "mom_profile_id": mom.id}
 
-@app.get("/api/mom/profile")
-def get_mom_profile(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
-    mom = session.exec(select(MomProfile).where(MomProfile.user_id == current_user.id)).first()
-    if not mom:
-        return {"user_id": current_user.id, "personality": {}, "voice_files": [], "consent_given": False, "created_at": None}
-    # load voice rows
-    voices = session.exec(select(MomVoice).where(MomVoice.mom_profile_id == mom.id, MomVoice.is_active == True)).all()
-    vlist = []
-    for v in voices:
-        vlist.append({
-            "id": v.id,
-            "filename": v.filename,
-            "stored_name": v.stored_name,
-            "path": v.path,
-            "mime_type": v.mime_type,
-            "size_bytes": v.size_bytes,
-            "duration_secs": float(v.duration_secs) if v.duration_secs is not None else None,
-            "status": v.status,
-            "uploaded_at": v.uploaded_at.isoformat() if v.uploaded_at else None
-        })
-    return {
-        "user_id": mom.user_id,
-        "personality": mom.personality or {},
-        "voice_files": vlist,
-        "consent_given": bool(mom.consent_given),
-        "voice_count": int(mom.voice_count or len(vlist)),
-        "created_at": mom.created_at.isoformat() if mom.created_at else None
-    }
+    return {"status": "ok", "mom_profile_id": mom.id}
 
-# Upload voice (authenticated) - multipart/form-data
+# -------------------------------------------------
+# VOICE UPLOAD
+# -------------------------------------------------
 @app.post("/api/mom/upload_voice")
 async def upload_mom_voice(
     consent: bool = Form(...),
@@ -260,90 +316,88 @@ async def upload_mom_voice(
     session: Session = Depends(get_session)
 ):
     if not consent:
-        raise HTTPException(status_code=400, detail="Consent is required to upload voice samples")
-    if not files or len(files) == 0:
-        raise HTTPException(status_code=400, detail="No audio files provided")
+        raise HTTPException(status_code=400, detail="Consent required")
 
-    # ensure mom profile exists
-    mom = session.exec(select(MomProfile).where(MomProfile.user_id == current_user.id)).first()
+    mom = session.exec(
+        select(MomProfile).where(MomProfile.user_id == current_user.id)
+    ).first()
+
     if not mom:
-        mom = MomProfile(user_id=current_user.id, personality={}, voice_count=0, consent_given=True)
+        mom = MomProfile(user_id=current_user.id, consent_given=True)
         session.add(mom)
         session.commit()
         session.refresh(mom)
 
-    saved_files = []
+    saved = []
+
     for f in files:
-        if not (f.content_type and f.content_type.startswith("audio/")):
-            raise HTTPException(status_code=400, detail=f"Invalid file type for {f.filename}")
+        content = await f.read()
+        name = f"{uuid.uuid4().hex}{os.path.splitext(f.filename)[1]}"
+        path = os.path.join(VOICE_DIR, name)
 
-        contents = await f.read()
-        max_bytes = 10 * 1024 * 1024
-        if len(contents) > max_bytes:
-            raise HTTPException(status_code=400, detail=f"File too large: {f.filename}")
+        async with aiofiles.open(path, "wb") as out:
+            await out.write(content)
 
-        ext = os.path.splitext(f.filename)[1] or ".wav"
-        safe_name = f"{uuid.uuid4().hex}{ext}"
-        out_path = os.path.join(VOICE_DIR, safe_name)
-
-        # write to disk
-        async with aiofiles.open(out_path, "wb") as out_f:
-            await out_f.write(contents)
-
-        # metadata
-        size_bytes = len(contents)
-        checksum = hashlib.sha256(contents).hexdigest()
-        rel_path = f"/static/mom_voices/{safe_name}"  # path used by app
-
-        # insert MomVoice row
-        mv = MomVoice(
+        voice = MomVoice(
             mom_profile_id=mom.id,
             user_id=current_user.id,
             filename=f.filename,
-            stored_name=safe_name,
-            path=rel_path,
+            stored_name=name,
+            path=f"/static/mom_voices/{name}",
             mime_type=f.content_type,
-            size_bytes=size_bytes,
-            duration_secs=None,
-            checksum=checksum,
-            status="validated",
-            is_active=True
+            size_bytes=len(content),
+            status="validated"
         )
-        session.add(mv)
-        saved_files.append(safe_name)
+        session.add(voice)
+        saved.append(name)
 
-    # commit voices
     session.commit()
 
-    # update voice_count on mom profile
-    voices = session.exec(select(MomVoice).where(MomVoice.mom_profile_id == mom.id, MomVoice.is_active == True)).all()
-    cnt = len(voices)
-    mom.voice_count = cnt
-    mom.consent_given = True
-    mom.updated_at = datetime.utcnow() if hasattr(mom, "updated_at") else mom.created_at
-    session.add(mom)
-    session.commit()
-    session.refresh(mom)
+    return {"status": "ok", "saved_files": saved}
 
-    return {"status": "ok", "saved_files": saved_files, "mom_profile_id": mom.id}
+# -------------------------------------------------
+# CHAT (PHASE 1)
+# -------------------------------------------------
+@app.post("/api/chat", response_model=ChatOut)
+def chat(
+    payload: ChatIn,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    message = payload.message
+    intent = detect_intent(message)
 
-# list voices by any user_id (admin-like)
-@app.get("/api/list_voices/{user_id}")
-def list_voices(user_id: int, session: Session = Depends(get_session)):
-    mom = session.exec(select(MomProfile).where(MomProfile.user_id == user_id)).first()
-    if not mom:
-        return {"voice_files": []}
-    voices = session.exec(select(MomVoice).where(MomVoice.mom_profile_id == mom.id, MomVoice.is_active == True)).all()
-    vlist = []
-    for v in voices:
-        vlist.append({
-            "id": v.id,
-            "filename": v.filename,
-            "stored_name": v.stored_name,
-            "path": v.path,
-            "mime_type": v.mime_type,
-            "size_bytes": v.size_bytes,
-            "status": v.status,
-            "uploaded_at": v.uploaded_at.isoformat() if v.uploaded_at else None
-        })
-    return {"voice_files": vlist}
+    # Default response
+    response = INTENT_RESPONSES.get(intent, INTENT_RESPONSES["neutral"])
+
+    event_data = intent_to_event(intent)
+
+    # Store event if applicable
+    if event_data:
+        event = UserEvent(
+            user_id=current_user.id,
+            event_type=event_data["event_type"],
+            event_key=event_data["event_key"],
+            severity=event_data["severity"],
+            source="ai",
+            context={"message": message}
+        )
+        session.add(event)
+        session.commit()
+
+        # 🔥 NEW: repetition check
+        repeat_count = count_recent_events(
+            session,
+            current_user.id,
+            event_data["event_key"]
+        )
+
+        if intent == "mistake" and repeat_count >= 3:
+            response = INTENT_RESPONSES["mistake"]["anger"]
+        elif intent == "mistake":
+            response = INTENT_RESPONSES["mistake"]["gentle"]
+
+    return {
+        "reply": response["reply"],
+        "tone": response["tone"]
+    }

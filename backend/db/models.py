@@ -102,6 +102,21 @@ class ErrorCatalog(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class UserEvent(SQLModel, table=True):
+    __tablename__ = "user_events"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="users.id")
+
+    event_type: str
+    event_key: str
+    severity: str = "medium"
+    source: str = "ai"
+
+    context: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    occurred_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 class ErrorOccurrence(SQLModel, table=True):
     __tablename__ = "error_occurrence"
     id: Optional[int] = Field(default=None, primary_key=True)
